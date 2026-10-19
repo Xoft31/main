@@ -150,7 +150,7 @@ impl MockDeploymentVerifier {
     /// live circuit; it panics on obviously malformed inputs so the
     /// contract's pre-verifier validation is still exercised.
     pub fn verify_proof(_env: Env, public_inputs: Bytes, proof: Bytes) {
-        if !matches!(public_inputs.len(), 128 | 160 | 224) || proof.is_empty() {
+        if !matches!(public_inputs.len(), 128 | 160 | 224 | 256) || proof.is_empty() {
             panic!("mock verifier: invalid inputs");
         }
     }
@@ -277,7 +277,7 @@ fn deployment_fixture_init_state_is_consistent() {
     // No proofs yet.
     let unknown_proof = slot(&f.env, domains::PROOF, 0xFF);
     assert!(client.get_proof(&unknown_proof).is_none());
-    assert!(!client.has_nullifier(&slot(&f.env, domains::NULLIFIER, 0)));
+    assert!(!client.has_nullifier(&client.get_verifier().unwrap(), &slot(&f.env, domains::NULLIFIER, 0)));
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn deployment_fixture_all_tiers_register_successfully() {
     );
     assert_eq!(anon_rec.tier, TIER_SILENT_WITNESS);
     assert_eq!(anon_rec.nullifier, Some(anon_nullifier.clone()));
-    assert!(client.has_nullifier(&anon_nullifier));
+    assert!(client.has_nullifier(&client.get_verifier().unwrap(), &anon_nullifier));
 
     // Tier 1 – anonymous_verified (uses mock verifier + public inputs).
     let av_proof_id = slot(&f.env, domains::PROOF, 0x02);
@@ -338,7 +338,7 @@ fn deployment_fixture_all_tiers_register_successfully() {
         &proof_buf(&f.env),
     );
     assert_eq!(av_rec.tier, TIER_SILENT_WITNESS);
-    assert!(client.has_nullifier(&av_nullifier));
+    assert!(client.has_nullifier(&client.get_verifier().unwrap(), &av_nullifier));
 
     // Tier 2 – consistent source.
     let src_proof_id = slot(&f.env, domains::PROOF, 0x03);
@@ -638,12 +638,7 @@ fn deployment_fixture_legacy_upgrade_preserves_deployed_state() {
     let expired_id = slot(&f.env, domains::PROOF, 0x14);
     let expired_video = slot(&f.env, domains::VIDEO, 0x14);
     let expired_metadata = slot(&f.env, domains::METADATA, 0x14);
-    let expired = client.register_source(
-        &f.source,
-        &expired_video,
-        &expired_metadata,
-        &expired_id,
-    );
+    let expired = client.register_source(&f.source, &expired_video, &expired_metadata, &expired_id);
 
     f.env.ledger().with_mut(|ledger| {
         ledger.timestamp = FIXTURE_TIMESTAMP + 2;
@@ -656,11 +651,17 @@ fn deployment_fixture_legacy_upgrade_preserves_deployed_state() {
     f.env.as_contract(&f.contract_id, || {
         f.env.storage().persistent().remove(&DataKey::SchemaVersion);
     });
-    assert_eq!(client.get_storage_schema_version(), SchemaVersion::V1 as u32);
+    assert_eq!(
+        client.get_storage_schema_version(),
+        SchemaVersion::V1 as u32
+    );
 
     client.upgrade_storage(&f.admin);
 
-    assert_eq!(client.get_storage_schema_version(), SchemaVersion::V1 as u32);
+    assert_eq!(
+        client.get_storage_schema_version(),
+        SchemaVersion::V1 as u32
+    );
     assert_eq!(f.env.events().all().events().len(), 0);
     assert_eq!(client.get_proof(&anonymous_id), Some(anonymous));
     assert_eq!(client.get_proof(&source_id), Some(source.clone()));
@@ -673,10 +674,12 @@ fn deployment_fixture_legacy_upgrade_preserves_deployed_state() {
         ProofVerificationStatus::Expired
     );
     assert!(!client.get_issuer(&f.issuer).unwrap().active);
-    assert!(!client
-        .get_credential_root(&f.credential_root)
-        .unwrap()
-        .active);
+    assert!(
+        !client
+            .get_credential_root(&f.credential_root)
+            .unwrap()
+            .active
+    );
     assert_eq!(client.get_verifier(), Some(f.verifier_id.clone()));
 
     let post_upgrade_id = slot(&f.env, domains::PROOF, 0x15);
@@ -839,4 +842,27 @@ fn deployment_fixture_custom_proof_ttl_is_stored() {
     let ttl = 86_400u64; // 1 day
     client.set_proof_ttl(&f.admin, &ttl);
     assert_eq!(client.get_proof_ttl(), ttl);
+}
+
+// ---------------------------------------------------------------------------
+// Receipt signer management (#337) — privileged like every entry point above
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn deployment_fixture_non_admin_cannot_add_receipt_signer() {
+    let f = DeploymentFixture::new();
+    let stranger = Address::generate(&f.env);
+    f.client()
+        .add_receipt_signer(&stranger, &BytesN::from_array(&f.env, &[0xEE; 65]));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn deployment_fixture_non_admin_cannot_revoke_receipt_signer() {
+    let f = DeploymentFixture::new();
+    let key = BytesN::from_array(&f.env, &[0xEE; 65]);
+    f.client().add_receipt_signer(&f.admin, &key);
+    let stranger = Address::generate(&f.env);
+    f.client().revoke_receipt_signer(&stranger, &key);
 }
